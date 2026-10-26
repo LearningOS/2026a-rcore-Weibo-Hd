@@ -29,6 +29,9 @@ use process::*;
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
+    // 先计数、再分发。这样 sys_trace 查询自身调用次数时，
+    // 「本次 trace 调用」也会被统计进去，符合实验文档的要求。
+    crate::task::inc_current_syscall_count(syscall_id);
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),

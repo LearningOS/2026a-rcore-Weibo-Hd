@@ -270,7 +270,13 @@ impl MemorySet {
         let start_vpn = start.floor();
         let end_vpn = end.ceil();
         for vpn in VPNRange::new(start_vpn, end_vpn) {
-            if self.page_table.translate(vpn).is_some() {
+            // 注意：translate 对「存在但无效」的叶子表项也会返回 Some，
+            // 所以这里必须再看 valid 位，否则同一二级页表下未分配的页会被误判为冲突
+            if self
+                .page_table
+                .translate(vpn)
+                .map_or(false, |pte| pte.is_valid())
+            {
                 return false;
             }
         }
@@ -292,7 +298,11 @@ impl MemorySet {
         }
         // 先整体检查一遍，保证失败时不会留下改了一半的地址空间
         for vpn in VPNRange::new(start_vpn, end_vpn) {
-            if self.page_table.translate(vpn).is_none() {
+            let mapped = self
+                .page_table
+                .translate(vpn)
+                .map_or(false, |pte| pte.is_valid() && pte.is_user());
+            if !mapped {
                 return false;
             }
         }

@@ -15,12 +15,14 @@ pub struct TimeVal {
 }
 
 /// 从用户虚拟地址读一个字节。
-/// 地址没有映射（或被映射成不可读）时返回 None，不panic。
+/// 地址没有映射、没有 U 权限（内核页）或不可读时返回 None，不 panic。
 fn user_read_u8(token: usize, addr: usize) -> Option<u8> {
     let page_table = PageTable::from_token(token);
     let va = VirtAddr::from(addr);
     let pte = page_table.translate(va.floor())?;
-    if !pte.readable() {
+    // translate 会返回「存在但无效」的叶子表项；另外必须要求 U 位，
+    // 否则像 isize::MAX 这种超出 Sv39 范围的地址会因索引截断撞上 trampoline 的页表项
+    if !pte.is_valid() || !pte.is_user() || !pte.readable() {
         return None;
     }
     Some(pte.ppn().get_bytes_array()[va.page_offset()])
@@ -31,7 +33,7 @@ fn user_write_u8(token: usize, addr: usize, value: u8) -> bool {
     let page_table = PageTable::from_token(token);
     let va = VirtAddr::from(addr);
     match page_table.translate(va.floor()) {
-        Some(pte) if pte.writable() => {
+        Some(pte) if pte.is_valid() && pte.is_user() && pte.writable() => {
             pte.ppn().get_bytes_array()[va.page_offset()] = value;
             true
         }

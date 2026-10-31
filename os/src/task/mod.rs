@@ -14,7 +14,9 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MemorySet;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +135,33 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// 在当前任务的地址空间上执行一段操作（sys_mmap / sys_munmap 要用）
+    fn with_current_memory_set<R>(&self, f: impl FnOnce(&mut MemorySet) -> R) -> R {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        f(&mut inner.tasks[cur].memory_set)
+    }
+
+    /// 把当前任务的某个系统调用计数加一
+    fn inc_current_syscall_count(&self, syscall_id: usize) {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_count[syscall_id] += 1;
+    }
+
+    /// 读取当前任务的某个系统调用计数
+    fn get_current_syscall_count(&self, syscall_id: usize) -> usize {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return 0;
+        }
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_count[syscall_id] as usize
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +230,19 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 在当前任务的地址空间上执行一段操作
+pub fn with_current_memory_set<R>(f: impl FnOnce(&mut MemorySet) -> R) -> R {
+    TASK_MANAGER.with_current_memory_set(f)
+}
+
+/// 记录当前任务发生了一次 `syscall_id` 调用（供 sys_trace 的统计功能使用）
+pub fn inc_current_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.inc_current_syscall_count(syscall_id);
+}
+
+/// 查询当前任务已经调用过多少次 `syscall_id`
+pub fn get_current_syscall_count(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
 }

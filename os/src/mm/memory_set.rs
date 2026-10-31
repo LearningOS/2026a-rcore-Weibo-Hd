@@ -262,6 +262,53 @@ impl MemorySet {
             false
         }
     }
+
+    /// 在 [start, start + len) 上建立一段匿名映射（对应 sys_mmap）。
+    /// 区间内已有页被映射时返回 false，此时不做任何修改。
+    pub fn mmap(&mut self, start: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        let end = VirtAddr::from(start.0 + len);
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self.page_table.translate(vpn).is_some() {
+                return false;
+            }
+        }
+        self.push(
+            MapArea::new(start, end, MapType::Framed, permission),
+            None,
+        );
+        true
+    }
+
+    /// 取消 [start, start + len) 的映射（对应 sys_munmap）。
+    /// 区间内只要有一页没被映射就返回 false，且不修改任何映射。
+    pub fn munmap(&mut self, start: VirtAddr, len: usize) -> bool {
+        let end = VirtAddr::from(start.0 + len);
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn == end_vpn {
+            return true;
+        }
+        // 先整体检查一遍，保证失败时不会留下改了一半的地址空间
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self.page_table.translate(vpn).is_none() {
+                return false;
+            }
+        }
+        let mut kept: Vec<MapArea> = Vec::new();
+        for area in self.areas.drain(..) {
+            let (left, right) = area.cut(&mut self.page_table, start_vpn, end_vpn);
+            if let Some(left) = left {
+                kept.push(left);
+            }
+            if let Some(right) = right {
+                kept.push(right);
+            }
+        }
+        self.areas = kept;
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -319,6 +366,61 @@ impl MapArea {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
+    }
+
+    /// 把本区域在 [cut_start, cut_end) 这段挖掉，返回剩下的左段和右段。
+    /// 与区间完全不相交时原样返回，右段为 None。
+    fn cut(
+        mut self,
+        page_table: &mut PageTable,
+        cut_start: VirtPageNum,
+        cut_end: VirtPageNum,
+    ) -> (Option<MapArea>, Option<MapArea>) {
+        let old_start = self.vpn_range.get_start();
+        let old_end = self.vpn_range.get_end();
+        if cut_end <= old_start || cut_start >= old_end {
+            return (Some(self), None);
+        }
+        let cut_start = cut_start.max(old_start);
+        let cut_end = cut_end.min(old_end);
+
+        // 按 cut_start / cut_end 把帧表切成三段：
+        //   self.data_frames -> 左段，right_all -> 被挖掉的中间段，right_frames -> 右段
+        let mut right_all = self.data_frames.split_off(&cut_start);
+        let right_frames = right_all.split_off(&cut_end);
+
+        // 中间段解除页表映射，FrameTracker 随 right_all 一起析构、物理页被回收
+        for vpn in VPNRange::new(cut_start, cut_end) {
+            page_table.unmap(vpn);
+        }
+
+        let left = if old_start < cut_start {
+            let mut area = MapArea::new(
+                VirtAddr::from(old_start),
+                VirtAddr::from(cut_start),
+                self.map_type,
+                self.map_perm,
+            );
+            area.data_frames = core::mem::take(&mut self.data_frames);
+            Some(area)
+        } else {
+            None
+        };
+
+        let right = if cut_end < old_end {
+            let mut area = MapArea::new(
+                VirtAddr::from(cut_end),
+                VirtAddr::from(old_end),
+                self.map_type,
+                self.map_perm,
+            );
+            area.data_frames = right_frames;
+            Some(area)
+        } else {
+            None
+        };
+
+        (left, right)
     }
     #[allow(unused)]
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {

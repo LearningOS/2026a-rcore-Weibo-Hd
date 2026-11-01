@@ -4,9 +4,7 @@ use alloc::sync::Arc;
 use crate::{
     config::{BIG_STRIDE, PAGE_SIZE},
     loader::get_app_data_by_name,
-    mm::{
-        translated_refmut, translated_str, MapPermission, PageTable, VirtAddr,
-    },
+    mm::{translated_refmut, translated_str, user_write_u8, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
@@ -19,19 +17,6 @@ use crate::{
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
-}
-
-/// 往用户虚拟地址写一个字节。地址不可写时返回 false。
-fn user_write_u8(token: usize, addr: usize, value: u8) -> bool {
-    let page_table = PageTable::from_token(token);
-    let va = VirtAddr::from(addr);
-    match page_table.translate(va.floor()) {
-        Some(pte) if pte.is_valid() && pte.is_user() && pte.writable() => {
-            pte.ppn().get_bytes_array()[va.page_offset()] = value;
-            true
-        }
-        _ => false,
-    }
 }
 
 /// task exits and submit an exit code

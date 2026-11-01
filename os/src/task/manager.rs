@@ -21,9 +21,28 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take a process out of the ready queue.
+    ///
+    /// 按 stride 调度：选出 stride 最小的进程，并把它的 pass 累加到自己 stride 上。
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        let mut min_idx = 0;
+        let mut min_stride = usize::MAX;
+        for (idx, task) in self.ready_queue.iter().enumerate() {
+            let stride = task.inner_exclusive_access().stride;
+            if stride < min_stride {
+                min_stride = stride;
+                min_idx = idx;
+            }
+        }
+        let task = self.ready_queue.remove(min_idx)?;
+        {
+            let mut inner = task.inner_exclusive_access();
+            inner.stride += inner.pass;
+        }
+        Some(task)
     }
 }
 

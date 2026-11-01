@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, TRAP_CONTEXT_BASE};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
@@ -68,6 +68,15 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// 进程优先级，stride 调度用，要求 >= 2
+    pub priority: usize,
+
+    /// 当前进程已经「跑过」的累计步数，每次被调度后加上 pass
+    pub stride: usize,
+
+    /// 每次被调度后 stride 的增量，等于 BIG_STRIDE / priority
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +127,9 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0,
+                    pass: BIG_STRIDE / 16,
                 })
             },
         };
@@ -191,6 +203,9 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride: 0,
+                    pass: parent_inner.pass,
                 })
             },
         });
@@ -204,6 +219,17 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// 创建一个执行新程序的新进程，并挂到当前进程的 children 下。
+    ///
+    /// 和 fork 的区别在于：spawn 直接用 elf 建一份新的地址空间，
+    /// 不需要复制父进程的内存，也不需要走「先 fork 再 exec」两步。
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let task = Arc::new(TaskControlBlock::new(elf_data));
+        task.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(task.clone());
+        task
     }
 
     /// get pid of process

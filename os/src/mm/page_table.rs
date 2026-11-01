@@ -56,11 +56,17 @@ impl PageTableEntry {
     }
     /// The page pointered by page table entry is writable?
     pub fn writable(&self) -> bool {
-        (self.flags() & PTEFlags::W) != PTEFlags::empty()
-    }
+        (self.flags() & PTEFlags::W) != PTEFlags::empty()    }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is accessible in user mode?
+    ///
+    /// 注意 `translate` 会返回「存在但无效」的页表项，
+    /// 判断能不能访问时除了本方法还要一起看 `is_valid`。
+    pub fn is_user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
 }
 

@@ -2,12 +2,16 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::{BIG_STRIDE, PAGE_SIZE},
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{
+        translated_refmut, translated_str, MapPermission, PageTable, VirtAddr,
+    },
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -15,6 +19,19 @@ use crate::{
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
+}
+
+/// 往用户虚拟地址写一个字节。地址不可写时返回 false。
+fn user_write_u8(token: usize, addr: usize, value: u8) -> bool {
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(addr);
+    match page_table.translate(va.floor()) {
+        Some(pte) if pte.is_valid() && pte.is_user() && pte.writable() => {
+            pte.ppn().get_bytes_array()[va.page_offset()] = value;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// task exits and submit an exit code
@@ -102,33 +119,88 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// get time with second and microsecond
+///
+/// `ts` 是用户虚拟地址，要先经页表翻译才能写。`TimeVal` 占 16 字节，
+/// 可能横跨两个页，所以逐字节写，由 `user_write_u8` 自己处理跨页。
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    for (offset, byte) in bytes.iter().enumerate() {
+        if !user_write_u8(token, ts as usize + offset, *byte) {
+            return -1;
+        }
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 建立匿名内存映射。
+///
+/// `prot` 是 Linux 那套位定义（bit0 可读、bit1 可写、bit2 可执行），
+/// 和内核 `MapPermission` 的位定义不是一回事，必须显式转换；
+/// 另外别忘了补 `MapPermission::U`，否则用户态一访问就缺页。
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+
+    let mut permission = MapPermission::U;
+    if prot & 0b001 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 0b010 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 0b100 != 0 {
+        permission |= MapPermission::X;
+    }
+
+    let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if start.checked_add(len).is_none() {
+        return -1;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.mmap(VirtAddr::from(start), len, permission) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 取消 [start, start + len) 的映射。
+/// 区间里只要有一页没映射过就返回 -1，且不做任何修改。
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if start.checked_add(len).is_none() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.munmap(VirtAddr::from(start), len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +213,35 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 创建一个执行指定程序的新进程，成功返回子进程 pid，失败返回 -1。
+///
+/// 注意 spawn 不需要像 fork 那样复制父进程的地址空间（见 `TaskControlBlock::spawn`）。
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let current = current_task().unwrap();
+        let new_task = current.spawn(data);
+        let new_pid = new_task.getpid();
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 设置当前进程的优先级，合法（>= 2）则返回 prio，否则返回 -1。
+pub fn sys_set_priority(prio: isize) -> isize {
+    trace!("kernel:pid[{}] sys_set_priority", current_task().unwrap().pid.0);
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.priority = prio as usize;
+    // 优先级极大时 BIG_STRIDE / prio 会退化成 0，这样该进程的 stride 永远不增长，
+    // 会把 CPU 一直占住，所以至少给 1
+    inner.pass = (BIG_STRIDE / prio as usize).max(1);
+    prio
 }

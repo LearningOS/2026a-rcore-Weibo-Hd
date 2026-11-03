@@ -6,7 +6,10 @@ use core::fmt::{Debug, Formatter, Result};
 /// Magic number for sanity check
 const EFS_MAGIC: u32 = 0x3b800001;
 /// The max number of direct inodes
-const INODE_DIRECT_COUNT: usize = 28;
+///
+/// 原来是 28。为了在 128 字节的 inode 里塞下 `nlink`，让出一个直接块的位置：
+/// 4(size) + 27*4(direct) + 4(indirect1) + 4(indirect2) + 1(type) + 3(padding) + 4(nlink) = 128
+const INODE_DIRECT_COUNT: usize = 27;
 /// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
 /// The max number of indirect1 inodes
@@ -86,6 +89,9 @@ pub struct DiskInode {
     pub indirect1: u32,
     pub indirect2: u32,
     type_: DiskInodeType,
+    /// 硬链接数。创建时为 1，每建一个硬链接加一，unlink 时减一，
+    /// 减到 0 说明没有目录项再指向它，可以回收 inode 和数据块
+    pub nlink: u32,
 }
 
 impl DiskInode {
@@ -97,6 +103,7 @@ impl DiskInode {
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+        self.nlink = 1;
     }
     /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {

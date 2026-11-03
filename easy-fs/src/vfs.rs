@@ -12,6 +12,8 @@ pub struct Inode {
     block_offset: usize,
     fs: Arc<Mutex<EasyFileSystem>>,
     block_device: Arc<dyn BlockDevice>,
+    /// inode 编号，fstat 要把它填进 Stat 的 ino 字段
+    inode_id: u32,
 }
 
 impl Inode {
@@ -19,6 +21,7 @@ impl Inode {
     pub fn new(
         block_id: u32,
         block_offset: usize,
+        inode_id: u32,
         fs: Arc<Mutex<EasyFileSystem>>,
         block_device: Arc<dyn BlockDevice>,
     ) -> Self {
@@ -27,6 +30,7 @@ impl Inode {
             block_offset,
             fs,
             block_device,
+            inode_id,
         }
     }
     /// Call a function over a disk inode to read it
@@ -67,11 +71,124 @@ impl Inode {
                 Arc::new(Self::new(
                     block_id,
                     block_offset,
+                    inode_id,
                     self.fs.clone(),
                     self.block_device.clone(),
                 ))
             })
         })
+    }
+    /// 获取 inode 编号
+    pub fn inode_id(&self) -> u32 {
+        self.inode_id
+    }
+    /// 获取硬链接数
+    pub fn nlink(&self) -> u32 {
+        self.read_disk_inode(|disk_inode| disk_inode.nlink)
+    }
+    /// 是否是目录
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+    /// 在当前目录下给 `old_name` 建一个别名 `new_name`（硬链接）。
+    ///
+    /// 两个名字指向同一个 inode，所以目标 inode 的 nlink 要加一。
+    /// 原名不存在、或新名已被占用时返回 false。
+    pub fn link(&self, old_name: &str, new_name: &str) -> bool {
+        let mut fs = self.fs.lock();
+        let old_inode_id =
+            self.read_disk_inode(|disk_inode| self.find_inode_id(old_name, disk_inode));
+        let inode_id = match old_inode_id {
+            Some(id) => id,
+            None => return false,
+        };
+        if self
+            .read_disk_inode(|disk_inode| self.find_inode_id(new_name, disk_inode))
+            .is_some()
+        {
+            return false;
+        }
+        // 目标 inode 的链接数加一
+        let (target_block_id, target_block_offset) = fs.get_disk_inode_pos(inode_id);
+        get_block_cache(target_block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(target_block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink += 1;
+            });
+        // 在当前目录末尾追加一个目录项
+        self.modify_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            let dirent = DirEntry::new(new_name, inode_id);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        block_cache_sync_all();
+        true
+    }
+    /// 删除当前目录下名为 `name` 的目录项。
+    ///
+    /// 目标 inode 的 nlink 减一，减到 0 说明没有任何目录项再指向它，
+    /// 这时把它的数据块和 inode 本身一起回收。名字不存在时返回 false。
+    pub fn unlink(&self, name: &str) -> bool {
+        let mut fs = self.fs.lock();
+        let found = self.read_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                if dirent.name() == name {
+                    return Some((i, dirent.inode_id()));
+                }
+            }
+            None
+        });
+        let (index, inode_id) = match found {
+            Some(v) => v,
+            None => return false,
+        };
+        // 用最后一个目录项填掉被删的位置，再把 size 缩回一个目录项
+        let file_count = self.read_disk_inode(|disk_inode| (disk_inode.size as usize) / DIRENT_SZ);
+        self.modify_disk_inode(|disk_inode| {
+            if index != file_count - 1 {
+                let mut last = DirEntry::empty();
+                disk_inode.read_at(
+                    (file_count - 1) * DIRENT_SZ,
+                    last.as_bytes_mut(),
+                    &self.block_device,
+                );
+                disk_inode.write_at(index * DIRENT_SZ, last.as_bytes(), &self.block_device);
+            }
+            disk_inode.size -= DIRENT_SZ as u32;
+        });
+        // nlink 减一
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        let nlink = get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink -= 1;
+                disk_inode.nlink
+            });
+        // 没人再指向它了，回收数据块和 inode
+        if nlink == 0 {
+            get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                .lock()
+                .modify(block_offset, |disk_inode: &mut DiskInode| {
+                    let size = disk_inode.size;
+                    let deallocated = disk_inode.clear_size(&self.block_device);
+                    assert_eq!(deallocated.len(), DiskInode::total_blocks(size) as usize);
+                    for block in deallocated {
+                        fs.dealloc_data(block);
+                    }
+                });
+            fs.dealloc_inode(inode_id);
+        }
+        block_cache_sync_all();
+        true
     }
     /// Increase the size of a disk inode
     fn increase_size(
@@ -133,6 +250,7 @@ impl Inode {
         Some(Arc::new(Self::new(
             block_id,
             block_offset,
+            new_inode_id,
             self.fs.clone(),
             self.block_device.clone(),
         )))

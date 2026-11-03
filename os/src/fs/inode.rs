@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -155,5 +155,21 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> Option<Stat> {
+        // 先把 Arc 拿出来，避免在持有 self.inner 的同时去读磁盘
+        let inode = self.inner.exclusive_access().inode.clone();
+        let is_dir = inode.is_dir();
+        Some(Stat {
+            dev: 0,
+            ino: inode.inode_id() as u64,
+            mode: if is_dir {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            },
+            nlink: inode.nlink(),
+            pad: [0; 7],
+        })
     }
 }

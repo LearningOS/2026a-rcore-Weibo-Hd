@@ -231,6 +231,17 @@ impl TaskControlBlock {
         // ---- release parent PCB
     }
 
+    /// 创建一个执行新程序的新进程，并挂到当前进程的 children 下。
+    ///
+    /// 和 fork 的区别是它直接用 elf 建一份新地址空间，
+    /// 不复制父进程的内存，也不用走「先 fork 再 exec」两步。
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let task = Arc::new(TaskControlBlock::new(elf_data));
+        task.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(task.clone());
+        task
+    }
+
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0

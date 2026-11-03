@@ -23,6 +23,24 @@ pub use page_table::{
     PageTableEntry, UserBuffer, UserBufferIterator,
 };
 
+/// 往用户虚拟地址写一个字节，地址未映射或不可写时返回 false。
+///
+/// syscall 层拿到的都是用户虚拟地址，不能直接解引用；
+/// 这里统一做地址翻译和权限检查。
+pub fn user_write_u8(token: usize, addr: usize, value: u8) -> bool {
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(addr);
+    match page_table.translate(va.floor()) {
+        // translate 会返回「存在但无效」的叶子表项，必须再看 valid 位；
+        // 同时要求 U 位，否则超出 Sv39 范围的地址会因索引截断撞上 trampoline 的页表项
+        Some(pte) if pte.is_valid() && pte.is_user() && pte.writable() => {
+            pte.ppn().get_bytes_array()[va.page_offset()] = value;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     heap_allocator::init_heap();

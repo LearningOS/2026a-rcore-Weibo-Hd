@@ -3,12 +3,14 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, user_write_u8, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -102,33 +104,86 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 获取当前时间，写进用户给的 `TimeVal`
+///
+/// `ts` 是用户虚拟地址，要先经页表翻译。`TimeVal` 占 16 字节，
+/// 可能横跨两个页，所以逐字节写，由 `user_write_u8` 处理跨页。
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    for (offset, byte) in bytes.iter().enumerate() {
+        if !user_write_u8(token, ts as usize + offset, *byte) {
+            return -1;
+        }
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 建立匿名内存映射
+///
+/// `prot` 是 Linux 的位定义（bit0 可读、bit1 可写、bit2 可执行），
+/// 转成内核的 `MapPermission` 时别忘了补 U 位，否则用户态一访问就缺页。
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+
+    let mut permission = MapPermission::U;
+    if prot & 0b001 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 0b010 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 0b100 != 0 {
+        permission |= MapPermission::X;
+    }
+
+    let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if start.checked_add(len).is_none() {
+        return -1;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.mmap(VirtAddr::from(start), len, permission) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// 取消 [start, start + len) 的映射；区间内有未映射页则返回 -1 且不做修改
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if start.checked_add(len).is_none() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.munmap(VirtAddr::from(start), len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
